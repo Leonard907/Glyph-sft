@@ -9,7 +9,7 @@ from word2png_function import text_to_images
 
 CONFIG_EN_PATH = '../config/config_en.json'
 OUTPUT_DIR = './output_images'
-INPUT_FILE = './input.txt'
+INPUT_FILE = '/mnt/lituou/Book_Builder/epub/All_Fours_full.txt'
 
 # Read text from file
 with open(INPUT_FILE, 'r', encoding='utf-8') as f:
@@ -20,7 +20,7 @@ images = text_to_images(
     text= text,
     output_dir=OUTPUT_DIR,
     config_path=CONFIG_EN_PATH,
-    unique_id='Little_Red_Riding_Hood'
+    unique_id='book_test2'
 )
 # b = time.time()
 # print(f"Time taken: {b - a} seconds")

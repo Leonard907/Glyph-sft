@@ -19,6 +19,7 @@ import math
 import requests
 from typing import List, Optional
 from PIL import Image
+import glob
 
 # Clear proxy settings
 os.environ.pop('http_proxy', None)
@@ -32,7 +33,7 @@ os.environ.pop('HTTPS_PROXY', None)
 
 MODEL_NAME = "glyph"
 API_KEY = ""
-API_URL = "http://your_api_url:port/v1/chat/completions"
+API_URL = "http://localhost:6001/v1/chat/completions"
 MAX_PIXELS = 36000000
 
 # ============================================================================
@@ -183,11 +184,14 @@ if __name__ == '__main__':
     # print()
     
     # Example 2: With images
+    # Get all images from the directory
+    image_paths = glob.glob("./output_images/book_test2/*.png")
+    image_paths.sort()  # Sort to ensure consistent order
+    print(image_paths)
+    
     response = vlm_inference(
-        question="Based on the story in the figures, what is the ending of wolf?",
-        image_paths=[
-            "./output_images/Little_Red_Riding_Hood/page_001.png"
-        ]
+        question="Produce a plot summary of the book shown in the images, in about 1000 words.",
+        image_paths=image_paths
     )
     print("Image response:")
     print(response)
