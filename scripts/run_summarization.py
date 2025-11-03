@@ -46,7 +46,7 @@ args = parse_arguments()
 port = args.port
 model = args.model
 mode = args.mode
-num_workers = args.max_workers
+num_workers = args.workers
 dpi = args.dpi
 task = "supersummary" # Hard code as no other tasks are supported
 
