@@ -4,6 +4,7 @@ import glob
 import json
 import argparse
 import sys
+import traceback
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from word2png_function import text_to_images
@@ -39,6 +40,11 @@ def parse_arguments():
         type=int,
         default=72
     )
+    parser.add_argument(
+        '--render-only',
+        action='store_true',
+        help='Only render images without running inference'
+    )
     return parser.parse_args()
 
 # Parse command line arguments
@@ -48,6 +54,7 @@ model = args.model
 mode = args.mode
 num_workers = args.workers
 dpi = args.dpi
+render_only = args.render_only
 task = "supersummary" # Hard code as no other tasks are supported
 
 dt = load_dataset("shipWr3ck/supersummary", split="test")
@@ -137,9 +144,10 @@ def run_inference(book_info):
         }
         
     except Exception as e:
+        error_trace = traceback.format_exc()
         return {
             'title': book_info['title'],
-            'summary': None,
+            'summary': f"Image Inference Error: {error_trace}",
             'success': False,
             'error': str(e)
         }
@@ -218,7 +226,12 @@ print(f"Successfully rendered/loaded: {rendering_success}")
 print(f"Failed to render: {rendering_failed}")
 
 # PHASE 2: Run inference (sequential or concurrent based on mode)
-if books_needing_inference:
+if render_only:
+    print("\n" + "=" * 80)
+    print("RENDER-ONLY MODE: Skipping inference phase")
+    print("=" * 80)
+    print(f"All images have been rendered to: {OUTPUT_BASE_DIR}")
+elif books_needing_inference:
     print("\n" + "=" * 80)
     print(f"PHASE 2: RUNNING INFERENCE ({mode.upper()} mode)")
     print("=" * 80)
@@ -237,6 +250,9 @@ if books_needing_inference:
                 successful_inference += 1
                 print(f"\nGenerated summary for '{result['title']}'")
             else:
+                # Save error message to JSON
+                save_summary_to_json(result['title'], result['summary'])
+                book_summaries[result['title']] = result['summary']
                 failed_inference += 1
                 error_msg = result['error'] if result['error'] else "Failed to generate summary"
                 print(f"\nFailed inference for '{result['title']}': {error_msg}")
@@ -264,6 +280,9 @@ if books_needing_inference:
                             'Current': result['title'][:30] + '...' if len(result['title']) > 30 else result['title']
                         })
                     else:
+                        # Save error message to JSON
+                        save_summary_to_json(result['title'], result['summary'])
+                        book_summaries[result['title']] = result['summary']
                         failed_inference += 1
                         error_msg = result['error'] if result['error'] else "Failed to generate summary"
                         print(f"\nFailed inference for '{result['title']}': {error_msg}")
