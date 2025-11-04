@@ -20,6 +20,7 @@ import requests
 from typing import List, Optional
 from PIL import Image
 import glob
+from openai_messages_token_helper import count_tokens_for_image
 
 # Clear proxy settings
 os.environ.pop('http_proxy', None)
@@ -35,6 +36,7 @@ MODEL_NAME = "glyph"
 API_KEY = ""
 API_URL = "http://localhost:6001/v1/chat/completions"
 MAX_PIXELS = 36000000
+MAX_INPUT_TOKENS=128000
 
 # ============================================================================
 # Helper Functions
@@ -94,14 +96,21 @@ def vlm_inference(
     
     # Add images if provided
     if image_paths:
+        total_image_tokens = 0
         for image_path in image_paths:
             image_path = image_path.strip()
             if os.path.exists(image_path):
                 try:
                     encoded = encode_image_with_max_pixels(image_path, max_pixels=max_pixels)
+                    encoded_img = f"data:image/png;base64,{encoded}"
+                    num_tokens = count_tokens_for_image(encoded_img)
+                    if total_image_tokens + num_tokens > MAX_INPUT_TOKENS:
+                        print(f"Truncated {len(image_paths) - len(user_contents)} images to fit max tokens.")
+                        break
+                    total_image_tokens += num_tokens
                     user_contents.append({
                         'type': 'image_url',
-                        'image_url': {"url": f"data:image/png;base64,{encoded}"}
+                        'image_url': {"url": encoded_img}
                     })
                 except Exception as e:
                     print(f"Warning: Failed to encode image {image_path}: {e}")
@@ -134,7 +143,7 @@ def vlm_inference(
     
     # Make API request
     try:
-        response = requests.post(api_url, headers=headers, data=json.dumps(payload), timeout=1200)
+        response = requests.post(api_url, headers=headers, data=json.dumps(payload), timeout=6000)
         
         # Check HTTP status
         if response.status_code != 200:
