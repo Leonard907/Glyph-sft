@@ -248,7 +248,6 @@ elif books_needing_inference:
                 save_summary_to_json(result['title'], result['summary'])
                 book_summaries[result['title']] = result['summary']
                 successful_inference += 1
-                print(f"\nGenerated summary for '{result['title']}'")
             else:
                 # Save error message to JSON
                 save_summary_to_json(result['title'], result['summary'])

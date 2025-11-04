@@ -93,6 +93,7 @@ def vlm_inference(
     
     # Build message content
     user_contents = []
+    num_truncated_images = -1
     
     # Add images if provided
     if image_paths:
@@ -106,6 +107,7 @@ def vlm_inference(
                     num_tokens = count_tokens_for_image(encoded_img)
                     if total_image_tokens + num_tokens > MAX_INPUT_TOKENS:
                         print(f"Truncated {len(image_paths) - len(user_contents)} images to fit max tokens.")
+                        num_truncated_images = len(image_paths) - len(user_contents)
                         break
                     total_image_tokens += num_tokens
                     user_contents.append({
@@ -166,7 +168,7 @@ def vlm_inference(
             print(f"Missing content in response: {result}")
             return None
         
-        return result['choices'][0]['message']['content']
+        return result['choices'][0]['message']['content'] if num_truncated_images == -1 else f"(Truncated {num_truncated_images} images)\n" + result['choices'][0]['message']['content']
         
     except requests.exceptions.Timeout:
         print("Request timeout")
