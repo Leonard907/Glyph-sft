@@ -36,7 +36,7 @@ MODEL_NAME = "glyph"
 API_KEY = ""
 API_URL = "http://localhost:6001/v1/chat/completions"
 MAX_PIXELS = 36000000
-MAX_INPUT_TOKENS=128000
+MAX_INPUT_TOKENS=256000
 
 # ============================================================================
 # Helper Functions
