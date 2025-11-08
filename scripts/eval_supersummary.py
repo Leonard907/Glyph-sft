@@ -3,6 +3,9 @@ from datasets import load_dataset
 from tqdm import tqdm
 import json
 import torch
+import os
+from pathlib import Path
+from bert_score import BERTScorer
 
 try:
     from alignscore import AlignScore
@@ -13,72 +16,131 @@ def parse_non_ascii(text):
     """Remove or handle non-ASCII characters"""
     return text.encode('ascii', 'ignore').decode('ascii')
 
-def eval_bertscore(input_output_pairs):
-    """Evaluate BERTScore for prediction-reference pairs"""
-    bertscore = load('bertscore')
+def prepare_all_predictions(json_files, dataset):
+    """
+    Prepare all predictions from all JSON files
+    Returns: dict mapping filename to (input_output_pairs, reference_texts)
+    """
+    all_data = {}
     
-    predictions = []
-    references = []
+    for json_file in json_files:
+        filename = json_file.name
+        
+        try:
+            with open(json_file, 'r') as f:
+                predictions = json.load(f)
+            
+            input_output_pairs = []
+            reference_texts = []
+            
+            for item in dataset:
+                gold_summary = item["output"]
+                title = item["title"]
+                input_text = item["input"]
+                
+                if title in predictions:
+                    predicted_summary = predictions[title].split("</think>")[-1].strip()
+                    input_output_pairs.append((predicted_summary, gold_summary))
+                    reference_texts.append(input_text)
+            
+            if len(input_output_pairs) > 0:
+                all_data[filename] = {
+                    'pairs': input_output_pairs,
+                    'references': reference_texts
+                }
+            else:
+                print(f"  WARNING: No matching predictions found in {filename}")
+                
+        except Exception as e:
+            print(f"  ERROR loading {filename}: {str(e)}")
+            continue
     
-    print("Preparing data for BERTScore...")
-    for pred, ref in input_output_pairs:
-        predictions.append(parse_non_ascii(pred))
-        references.append(parse_non_ascii(ref))
-    
-    print("Computing BERTScore...")
-    scores = bertscore.compute(
-        predictions=predictions, 
-        references=references, 
-        model_type="microsoft/deberta-xlarge-mnli", 
-        batch_size=4
-    )
-    
-    avg_precision = sum(scores["precision"]) / len(scores["precision"])
-    avg_recall = sum(scores["recall"]) / len(scores["recall"])
-    avg_f1 = sum(scores["f1"]) / len(scores["f1"])
-    
-    return {
-        "precision": avg_precision,
-        "recall": avg_recall,
-        "f1": avg_f1
-    }
+    return all_data
 
-def eval_rouge(input_output_pairs):
-    """Evaluate ROUGE scores for prediction-reference pairs"""
+def eval_rouge_all(all_data):
+    """Evaluate ROUGE scores for all files at once"""
+    print("=" * 70)
+    print("Computing ROUGE for all files...")
+    print("=" * 70)
+    
     rouge = load('rouge')
+    results = {}
     
-    predictions = []
-    references = []
+    for filename, data in tqdm(all_data.items(), desc="ROUGE"):
+        predictions = []
+        references = []
+        
+        for pred, ref in data['pairs']:
+            predictions.append(parse_non_ascii(pred))
+            references.append(parse_non_ascii(ref))
+        
+        scores = rouge.compute(
+            predictions=predictions, 
+            references=references, 
+            use_stemmer=True
+        )
+        
+        # Compute geometric mean of ROUGE-1, ROUGE-2, and ROUGE-L F1 scores
+        rouge1 = scores['rouge1']
+        rouge2 = scores['rouge2']
+        rougeL = scores['rougeL']
+        geometric_mean = (rouge1 * rouge2 * rougeL) ** (1/3)
+        
+        results[filename] = {
+            "rouge1": rouge1,
+            "rouge2": rouge2,
+            "rougeL": rougeL,
+            "geometric_mean": geometric_mean
+        }
+        
+        print(f"  {filename}: ROUGE-1={rouge1:.4f}, ROUGE-2={rouge2:.4f}, ROUGE-L={rougeL:.4f}, GM={geometric_mean:.4f}")
     
-    for pred, ref in input_output_pairs:
-        predictions.append(parse_non_ascii(pred))
-        references.append(parse_non_ascii(ref))
-    
-    print("Computing ROUGE...")
-    scores = rouge.compute(
-        predictions=predictions, 
-        references=references, 
-        use_stemmer=True
-    )
-    
-    # Compute geometric mean of ROUGE-1, ROUGE-2, and ROUGE-L F1 scores
-    rouge1 = scores['rouge1']
-    rouge2 = scores['rouge2']
-    rougeL = scores['rougeL']
-    geometric_mean = (rouge1 * rouge2 * rougeL) ** (1/3)
-    
-    return {
-        "geometric_mean": geometric_mean,
-        "rouge1": rouge1,
-        "rouge2": rouge2,
-        "rougeL": rougeL
-    }
+    return results
 
-def eval_alignscore(input_output_pairs, reference_texts):
-    """
-    Evaluate AlignScore for prediction-reference pairs
-    reference_texts: list of input documents for factuality checking
-    """
+def eval_bertscore_all(all_data):
+    """Evaluate BERTScore for all files at once"""
+    print("\n" + "=" * 70)
+    print("Computing BERTScore for all files...")
+    print("=" * 70)
+    
+    scorer = BERTScorer(model_type="microsoft/deberta-xlarge-mnli", batch_size=1, device='cuda:0')
+    results = {}
+    
+    for filename, data in tqdm(all_data.items(), desc="BERTScore"):
+        total_precision = 0
+        total_recall = 0
+        total_f1 = 0
+        
+        for pred, ref in tqdm(data['pairs'], desc=f"  {filename}", leave=False):
+            pred_clean = parse_non_ascii(pred)
+            ref_clean = parse_non_ascii(ref)
+            
+            precision, recall, f1 = scorer.score([pred_clean], [ref_clean])
+            
+            total_precision += precision.item()
+            total_recall += recall.item()
+            total_f1 += f1.item()
+        
+        avg_precision = total_precision / len(data['pairs'])
+        avg_recall = total_recall / len(data['pairs'])
+        avg_f1 = total_f1 / len(data['pairs'])
+        
+        results[filename] = {
+            "precision": avg_precision,
+            "recall": avg_recall,
+            "f1": avg_f1
+        }
+        
+        print(f"  {filename}: Precision={avg_precision:.4f}, Recall={avg_recall:.4f}, F1={avg_f1:.4f}")
+    
+    return results
+
+def eval_alignscore_all(all_data):
+    """Evaluate AlignScore for all files at once"""
+    print("\n" + "=" * 70)
+    print("Computing AlignScore for all files...")
+    print("=" * 70)
+    
     scorer = AlignScore(
         model='roberta-large', 
         batch_size=32, 
@@ -88,81 +150,89 @@ def eval_alignscore(input_output_pairs, reference_texts):
         verbose=False
     )
     
-    total_score = 0
-    print("Computing AlignScore...")
+    results = {}
     
-    for i, (pred, ref) in enumerate(tqdm(input_output_pairs)):
-        context = parse_non_ascii(reference_texts[i])
-        claim = parse_non_ascii(pred)
-        score = scorer.score(contexts=[context], claims=[claim])[0]
-        total_score += score
+    for filename, data in all_data.items():
+        print(f"  Processing {filename}...")
+        total_score = 0
+        
+        for i, (pred, ref) in enumerate(tqdm(data['pairs'], desc=f"  {filename}", leave=False)):
+            context = parse_non_ascii(data['references'][i])
+            claim = parse_non_ascii(pred)
+            score = scorer.score(contexts=[context], claims=[claim])[0]
+            total_score += score
+        
+        avg_score = total_score / len(data['pairs'])
+        results[filename] = avg_score
+        print(f"    AlignScore: {avg_score:.4f}")
     
-    avg_score = total_score / len(input_output_pairs)
-    return avg_score
+    return results
 
 # Main evaluation code
 if __name__ == "__main__":
-    # Load dataset and predictions
+    results_folder = "/mnt/lituou/Glyph-sft/scripts/results"
+    output_file = os.path.join(results_folder, "full_eval.json")
+    
+    # Load dataset once
+    print("Loading dataset...")
     dt = load_dataset("shipWr3ck/supersummary", split="test")
-    predictions = json.load(open("/mnt/lituou/Glyph-sft/scripts/results/gemma3-27b_supersummary_dpi72.json"))
     
-    # Prepare input-output pairs
-    input_output_pairs = []
-    reference_texts = []  # For AlignScore (input documents)
+    # Find all JSON files in the folder
+    json_files = list(Path(results_folder).glob("*.json"))
+    # Exclude the output file itself if it exists
+    json_files = [f for f in json_files if f.name != "full_eval.json"]
     
-    for item in dt:
-        gold_summary = item["output"]
-        title = item["title"]
-        input_text = item["input"]  # Assuming this exists in the dataset
-        
-        if title in predictions:
-            predicted_summary = predictions[title]
-            input_output_pairs.append((predicted_summary, gold_summary))
-            reference_texts.append(input_text)
+    print(f"Found {len(json_files)} JSON files to evaluate\n")
     
-    print(f"Evaluating {len(input_output_pairs)} predictions...\n")
+    # Prepare all predictions
+    print("Preparing all predictions...")
+    all_data = prepare_all_predictions(json_files, dt)
+    print(f"Successfully loaded {len(all_data)} files\n")
     
-    # Run evaluations with torch.no_grad() for efficiency
+    if len(all_data) == 0:
+        print("No valid prediction files found. Exiting.")
+        exit(1)
+    
+    # Run all evaluations with torch.no_grad() for efficiency
     with torch.no_grad():
-        # 1. ROUGE
-        print("=" * 50)
-        print("ROUGE Evaluation")
-        print("=" * 50)
-        rouge_scores = eval_rouge(input_output_pairs)
-        print(f"ROUGE-1: {rouge_scores['rouge1']:.4f}")
-        print(f"ROUGE-2: {rouge_scores['rouge2']:.4f}")
-        print(f"ROUGE-L: {rouge_scores['rougeL']:.4f}")
-        print(f"Geometric Mean: {rouge_scores['geometric_mean']:.4f}\n")
+        # 1. ROUGE - all files
+        # rouge_results = eval_rouge_all(all_data)
         
-        # 2. BERTScore
-        print("=" * 50)
-        print("BERTScore Evaluation")
-        print("=" * 50)
-        bertscore_results = eval_bertscore(input_output_pairs)
-        print(f"Precision: {bertscore_results['precision']:.4f}")
-        print(f"Recall: {bertscore_results['recall']:.4f}")
-        print(f"F1: {bertscore_results['f1']:.4f}\n")
+        # # 2. BERTScore - all files
+        # bertscore_results = eval_bertscore_all(all_data)
         
-        # 3. AlignScore (if input texts are available)
-        if reference_texts:
-            print("=" * 50)
-            print("AlignScore Evaluation")
-            print("=" * 50)
-            alignscore_result = eval_alignscore(input_output_pairs, reference_texts)
-            print(f"AlignScore: {alignscore_result:.4f}\n")
-        
-        # Save all results
-        results = {
-            "rouge": rouge_scores,
-            "bertscore": bertscore_results,
+        # 3. AlignScore - all files
+        alignscore_results = eval_alignscore_all(all_data)
+        # alignscore_results = {filename: 0 for filename in all_data.keys()}
+    
+    # Combine all results
+    all_results = {}
+    for filename in all_data.keys():
+        all_results[filename] = {
+            "rouge": rouge_results[filename],
+            "bertscore": bertscore_results[filename],
+            "alignscore": alignscore_results[filename],
+            "num_predictions": len(all_data[filename]['pairs'])
         }
-        
-        if reference_texts:
-            results["alignscore"] = alignscore_result
-        
-        # Save to file
-        output_file = "/mnt/lituou/Glyph-sft/scripts/results/gemma3-27b_supersummary_dpi72_eval.json"
-        with open(output_file, 'w') as f:
-            json.dump(results, f, indent=2)
-        
-        print(f"Results saved to {output_file}")
+    
+    # Save all results to file
+    print("\n" + "=" * 70)
+    print("Saving results...")
+    with open(output_file, 'w') as f:
+        json.dump(all_results, f, indent=2)
+    
+    print(f"All results saved to {output_file}")
+    print(f"Total files evaluated: {len(all_results)}")
+    
+    # Print summary table
+    print("\n" + "=" * 70)
+    print("SUMMARY TABLE")
+    print("=" * 70)
+    print(f"{'Filename':<50} {'ROUGE-GM':<12} {'BERTScore':<12} {'Predictions':<12}")
+    print("-" * 70)
+    for filename, results in sorted(all_results.items()):
+        rouge_gm = results['rouge']['geometric_mean']
+        bert_f1 = results['bertscore']['f1']
+        num_preds = results['num_predictions']
+        print(f"{filename:<50} {rouge_gm:<12.4f} {bert_f1:<12.4f} {num_preds:<12}")
+    print("=" * 70)
