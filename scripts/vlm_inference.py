@@ -62,8 +62,9 @@ def vlm_inference(
     api_key: str = API_KEY,
     model_name: str = MODEL_NAME,
     max_pixels: int = MAX_PIXELS,
-    max_tokens: int = 8192,
-    temperature: float = 0.0001
+    max_tokens: int = 4096,
+    temperature: float = 0.0001,
+    max_input_tokens: int = MAX_INPUT_TOKENS
 ) -> Optional[str]:
     """
     Vision Language Model Inference
@@ -77,6 +78,7 @@ def vlm_inference(
         max_pixels: Maximum pixels for image encoding
         max_tokens: Maximum tokens in response
         temperature: Sampling temperature
+        max_input_tokens: Maximum input tokens for truncating images (default: MAX_INPUT_TOKENS)
         
     Returns:
         str: Model response text, or None if error
@@ -105,7 +107,7 @@ def vlm_inference(
                     encoded = encode_image_with_max_pixels(image_path, max_pixels=max_pixels)
                     encoded_img = f"data:image/png;base64,{encoded}"
                     num_tokens = count_tokens_for_image(encoded_img)
-                    if total_image_tokens + num_tokens > MAX_INPUT_TOKENS:
+                    if total_image_tokens + num_tokens > max_input_tokens:
                         print(f"Truncated {len(image_paths) - len(user_contents)} images to fit max tokens.")
                         num_truncated_images = len(image_paths) - len(user_contents)
                         break

@@ -43,6 +43,12 @@ def parse_arguments():
         action='store_true',
         help='Only render images without running inference'
     )
+    parser.add_argument(
+        '--max-tokens',
+        type=int,
+        default=256000,
+        help='Maximum number of input tokens when truncating images (default: 256000)'
+    )
     return parser.parse_args()
 
 # Parse command line arguments
@@ -53,6 +59,7 @@ mode = args.mode
 num_workers = args.workers
 dpi = args.dpi
 render_only = args.render_only
+max_input_tokens = args.max_tokens
 task = "loong" # Hard code as QA task
 
 # Hard-coded input jsonl file path
@@ -156,7 +163,8 @@ def run_inference(item_info):
             question=item_info['question'],
             image_paths=item_info['image_paths'],
             api_url=f"http://localhost:{port}/v1/chat/completions",
-            model_name=model
+            model_name=model,
+            max_input_tokens=max_input_tokens
         )
         
         return {
