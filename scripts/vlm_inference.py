@@ -62,7 +62,7 @@ def vlm_inference(
     api_key: str = API_KEY,
     model_name: str = MODEL_NAME,
     max_pixels: int = MAX_PIXELS,
-    max_tokens: int = 4096,
+    max_tokens: int = 8192,
     temperature: float = 0.0001,
     max_input_tokens: int = MAX_INPUT_TOKENS
 ) -> Optional[str]:

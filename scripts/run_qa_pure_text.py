@@ -1,16 +1,15 @@
 import os
-import glob
 import json
 import argparse
 import traceback
+import requests
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from word2png_function import text_to_images
-from vlm_inference import vlm_inference
+from transformers import AutoTokenizer
 
 def parse_arguments():
     """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description="Process QA dataset with text-to-image rendering and VLM question answering")
+    parser = argparse.ArgumentParser(description="Process QA dataset with pure text question answering")
     parser.add_argument(
         '--mode', 
         choices=['sequential', 'concurrent'], 
@@ -34,20 +33,22 @@ def parse_arguments():
         help='Port number for the service'
     )
     parser.add_argument(
-        '--dpi',
-        type=int,
-        default=72
-    )
-    parser.add_argument(
-        '--render-only',
-        action='store_true',
-        help='Only render images without running inference'
-    )
-    parser.add_argument(
         '--max-tokens',
         type=int,
-        default=256000,
-        help='Maximum number of input tokens when truncating images (default: 256000)'
+        default=8192,
+        help='Maximum number of tokens in response (default: 8192)'
+    )
+    parser.add_argument(
+        '--temperature',
+        type=float,
+        default=0.0001,
+        help='Sampling temperature (default: 0.0001)'
+    )
+    parser.add_argument(
+        '--max-input-tokens',
+        type=int,
+        default=None,
+        help='Maximum number of input tokens. If set, docs will be truncated to fit (default: None)'
     )
     return parser.parse_args()
 
@@ -57,19 +58,45 @@ port = args.port
 model = args.model
 mode = args.mode
 num_workers = args.workers
-dpi = args.dpi
-render_only = args.render_only
-max_input_tokens = args.max_tokens
-task = "loong" # Hard code as QA task
+max_tokens = args.max_tokens
+temperature = args.temperature
+max_input_tokens = args.max_input_tokens
+task = "loong_pure_text" # Hard code as QA task
 
 # Hard-coded input jsonl file path
 INPUT_JSONL_FILE = './loong_process_100k.jsonl'  # Hard-coded input file
 
+MODEL_ID_MAPPING = {
+    "gemma3-12b": "google/gemma3-12b-it",
+    "qwen3-8b": "Qwen/Qwen3-VL-8B-Instruct",
+    "qwen3-30b": "Qwen/Qwen3-VL-30B-A3B-Instruct",
+    "qwen3-30b-thinking": "Qwen/Qwen3-VL-30B-A3B-Thinking",
+    "kimi-a3b": "moonshotai/Kimi-VL-A3B-Thinking",
+    "glyph": "zai-org/Glyph"
+}
+
 # Configuration
-CONFIG_EN_PATH = f'../config/config_en_dpi{dpi}.json'
-OUTPUT_BASE_DIR = f'./{task}_images_dpi{dpi}'
-OUTPUT_JSON_FILE = f'./results/{model}_{task}_dpi{dpi}.json'
+OUTPUT_JSON_FILE = f'./results/{model}_{task}.json'
 MAX_WORKERS = num_workers
+
+# Load tokenizer if max_input_tokens is specified
+tokenizer = None
+if max_input_tokens is not None:
+    if model not in MODEL_ID_MAPPING:
+        raise ValueError(f"Model '{model}' not found in MODEL_ID_MAPPING. Available models: {list(MODEL_ID_MAPPING.keys())}")
+    model_id = MODEL_ID_MAPPING[model]
+    print(f"Loading tokenizer for model: {model_id}")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        print(f"Tokenizer loaded successfully")
+    except Exception as e:
+        raise RuntimeError(f"Failed to load tokenizer for {model_id}: {e}")
+
+# Clear proxy settings
+os.environ.pop('http_proxy', None)
+os.environ.pop('https_proxy', None)
+os.environ.pop('HTTP_PROXY', None)
+os.environ.pop('HTTPS_PROXY', None)
 
 def load_jsonl(file_path):
     """Load data from jsonl file"""
@@ -101,92 +128,177 @@ def load_jsonl(file_path):
     
     return items
 
-def render_doc_images(item, item_index=None):
-    """Render a single document to images"""
-    doc_text = item['docs']
-    item_id = item.get('id', f"item_{item_index if item_index is not None else 'unknown'}")
+def truncate_docs(docs, question, max_input_tokens, tokenizer):
+    """
+    Truncate docs to fit within max_input_tokens while keeping question intact.
+    
+    Args:
+        docs: The document text to truncate
+        question: The question text (must remain intact)
+        max_input_tokens: Maximum total input tokens
+        tokenizer: The tokenizer to use
+    
+    Returns:
+        Truncated docs text
+    """
+    if tokenizer is None or max_input_tokens is None:
+        return docs
+    
+    # Tokenize the question and separator
+    separator = "\n\n"
+    question_tokens = tokenizer.encode(question, add_special_tokens=False)
+    separator_tokens = tokenizer.encode(separator, add_special_tokens=False)
+    
+    # Calculate available tokens for docs
+    used_tokens = len(question_tokens) + len(separator_tokens)
+    available_tokens = max_input_tokens - used_tokens
+    
+    if available_tokens <= 0:
+        raise ValueError(f"Question and separator already exceed max_input_tokens ({max_input_tokens})")
+    
+    # Tokenize docs
+    docs_tokens = tokenizer.encode(docs, add_special_tokens=False)
+    
+    # If docs fit within available tokens, return as is
+    if len(docs_tokens) <= available_tokens:
+        return docs
+    
+    # Truncate docs tokens to fit
+    truncated_docs_tokens = docs_tokens[:available_tokens]
+    
+    # Decode back to text
+    truncated_docs = tokenizer.decode(truncated_docs_tokens, skip_special_tokens=True)
+    
+    return truncated_docs
+
+def run_inference(item):
+    """Run text-only inference on document and question"""
+    item_id = item.get('id', 'unknown')
     question = item.get('final_question', '')
+    docs = item.get('docs', '')
+    
+    # Truncate docs if max_input_tokens is specified
+    if max_input_tokens is not None and tokenizer is not None:
+        try:
+            docs = truncate_docs(docs, question, max_input_tokens, tokenizer)
+        except Exception as e:
+            error_msg = f"Truncation error: {e}"
+            print(f"Warning for item '{item_id}': {error_msg}")
+            # Continue with original docs if truncation fails
+    
+    # Concatenate docs and question with "\n\n" separator
+    prompt = f"{docs}\n\n{question}"
     
     try:
-        # Clean item ID for use as directory name
-        safe_id = "".join(c for c in str(item_id) if c.isalnum() or c in (' ', '-', '_')).rstrip()
-        safe_id = safe_id.replace(' ', '_')
+        # Build request payload for text-only inference
+        messages = [{'role': 'user', 'content': prompt}]
         
-        doc_image_dir = os.path.join(OUTPUT_BASE_DIR, safe_id)
+        payload = {
+            "messages": messages,
+            "max_tokens": max_tokens,
+        }
         
-        # Check if images are already rendered
-        if os.path.exists(doc_image_dir) and os.listdir(doc_image_dir):
-            image_paths = glob.glob(os.path.join(doc_image_dir, '*.png'))
+        headers = {
+            'Content-Type': 'application/json'
+        }
+        
+        api_url = f"http://localhost:{port}/v1/chat/completions"
+        
+        # Make API request
+        response = requests.post(api_url, headers=headers, data=json.dumps(payload), timeout=6000)
+        
+        # Check HTTP status
+        if response.status_code != 200:
+            error_msg = f"HTTP error: {response.status_code}, Response: {response.text}"
+            print(f"Error for item '{item_id}': {error_msg}")
             return {
                 'id': item_id,
                 'question': question,
-                'safe_id': safe_id,
-                'image_paths': sorted(image_paths),
-                'success': True,
-                'error': None,
-                'skipped': True
+                'answer': f"API Error: {error_msg}",
+                'success': False,
+                'error': error_msg
             }
-        else:
-            # Render document text to images
-            image_paths = text_to_images(
-                text=doc_text,
-                output_dir=OUTPUT_BASE_DIR,
-                config_path=CONFIG_EN_PATH,
-                unique_id=safe_id
-            )
-            
+        
+        # Parse JSON response
+        try:
+            result = response.json()
+        except json.JSONDecodeError as e:
+            error_msg = f"JSON decode error: {e}, Raw response: {response.text}"
+            print(f"Error for item '{item_id}': {error_msg}")
             return {
                 'id': item_id,
                 'question': question,
-                'safe_id': safe_id,
-                'image_paths': sorted(image_paths),
-                'success': True,
-                'error': None,
-                'skipped': False
+                'answer': f"JSON Error: {error_msg}",
+                'success': False,
+                'error': error_msg
             }
         
-    except Exception as e:
+        # Validate response structure
+        if 'choices' not in result or not result['choices']:
+            error_msg = f"Invalid response structure: {result}"
+            print(f"Error for item '{item_id}': {error_msg}")
+            return {
+                'id': item_id,
+                'question': question,
+                'answer': f"Invalid Response: {error_msg}",
+                'success': False,
+                'error': error_msg
+            }
+        
+        if 'message' not in result['choices'][0] or 'content' not in result['choices'][0]['message']:
+            error_msg = f"Missing content in response: {result}"
+            print(f"Error for item '{item_id}': {error_msg}")
+            return {
+                'id': item_id,
+                'question': question,
+                'answer': f"Missing Content: {error_msg}",
+                'success': False,
+                'error': error_msg
+            }
+        
+        answer = result['choices'][0]['message']['content']
+        
         return {
             'id': item_id,
             'question': question,
-            'safe_id': None,
-            'image_paths': None,
-            'success': False,
-            'error': str(e),
-            'skipped': False
-        }
-
-def run_inference(item_info):
-    """Run VLM inference on rendered document images"""
-    try:
-        answer = vlm_inference(
-            question=item_info['question'],
-            image_paths=item_info['image_paths'],
-            api_url=f"http://localhost:{port}/v1/chat/completions",
-            model_name=model,
-            max_input_tokens=max_input_tokens
-        )
-        
-        return {
-            'id': item_info['id'],
-            'question': item_info['question'],
             'answer': answer,
             'success': True,
             'error': None
         }
         
+    except requests.exceptions.Timeout:
+        error_msg = "Request timeout"
+        print(f"Error for item '{item_id}': {error_msg}")
+        return {
+            'id': item_id,
+            'question': question,
+            'answer': f"Timeout Error: {error_msg}",
+            'success': False,
+            'error': error_msg
+        }
+    except requests.exceptions.ConnectionError as e:
+        error_msg = f"Connection error: {e}"
+        print(f"Error for item '{item_id}': {error_msg}")
+        return {
+            'id': item_id,
+            'question': question,
+            'answer': f"Connection Error: {error_msg}",
+            'success': False,
+            'error': error_msg
+        }
     except Exception as e:
         error_trace = traceback.format_exc()
+        error_msg = f"Unexpected error: {type(e).__name__}: {e}"
+        print(f"Error for item '{item_id}': {error_msg}")
         return {
-            'id': item_info['id'],
-            'question': item_info['question'],
-            'answer': f"Image Inference Error: {error_trace}",
+            'id': item_id,
+            'question': question,
+            'answer': f"Unexpected Error: {error_trace}",
             'success': False,
-            'error': error_trace  # Use full error trace for output
+            'error': error_msg
         }
 
 # Create base output directory if it doesn't exist
-os.makedirs(OUTPUT_BASE_DIR, exist_ok=True)
 os.makedirs(os.path.dirname(OUTPUT_JSON_FILE), exist_ok=True)
 
 # Load input data from jsonl file
@@ -230,61 +342,31 @@ def save_answer_to_json(item_id, question, answer):
     with open(OUTPUT_JSON_FILE, 'w', encoding='utf-8') as f:
         json.dump(existing_results, f, indent=2, ensure_ascii=False)
 
-# PHASE 1: Render all images sequentially
+# Run inference (sequential or concurrent based on mode)
 print("=" * 80)
-print("PHASE 1: RENDERING IMAGES (Sequential)")
+print(f"RUNNING INFERENCE ({mode.upper()} mode)")
 print("=" * 80)
 
 items_needing_inference = []
-rendering_failed = 0
-rendering_skipped = 0
-rendering_success = 0
 
-for idx, item in enumerate(tqdm(dt, desc="Rendering document images", unit="item")):
-    # Skip items that already have answers
+# Filter out items that already have answers
+for idx, item in enumerate(dt):
     item_id = item.get('id', f"item_{idx}")
-    if item_id in qa_results:
-        rendering_skipped += 1
-        continue
-    
-    result = render_doc_images(item, item_index=idx)
-    
-    if result['success']:
-        if result['skipped']:
-            print(f"\nImages for item '{result['id']}' already exist, using existing images.")
-        else:
-            print(f"\nRendered {len(result['image_paths'])} images for item '{result['id']}'")
-        
-        items_needing_inference.append(result)
-        rendering_success += 1
-    else:
-        rendering_failed += 1
-        print(f"\nFailed to render item '{result['id']}': {result['error']}")
+    if item_id not in qa_results:
+        items_needing_inference.append(item)
 
-print(f"\nRendering phase complete!")
 print(f"Total items: {len(dt)}")
 print(f"Already have answers (skipped): {len(qa_results)}")
-print(f"Successfully rendered/loaded: {rendering_success}")
-print(f"Failed to render: {rendering_failed}")
+print(f"Items needing inference: {len(items_needing_inference)}")
 
-# PHASE 2: Run inference (sequential or concurrent based on mode)
-if render_only:
-    print("\n" + "=" * 80)
-    print("RENDER-ONLY MODE: Skipping inference phase")
-    print("=" * 80)
-    print(f"All images have been rendered to: {OUTPUT_BASE_DIR}")
-elif items_needing_inference:
-    print("\n" + "=" * 80)
-    print(f"PHASE 2: RUNNING INFERENCE ({mode.upper()} mode)")
-    print("=" * 80)
-    
+if items_needing_inference:
     successful_inference = 0
     failed_inference = 0
     
     if mode == 'sequential':
         # Sequential inference
-        for item_info in tqdm(items_needing_inference, desc="Running inference", unit="item"):
-            result = run_inference(item_info)
+        for item in tqdm(items_needing_inference, desc="Running inference", unit="item"):
+            result = run_inference(item)
             
             if result['success'] and result['answer']:
                 save_answer_to_json(result['id'], result['question'], result['answer'])
@@ -294,7 +376,7 @@ elif items_needing_inference:
                 }
                 successful_inference += 1
             else:
-                # Save full error trace to JSON
+                # Save error message to JSON
                 save_answer_to_json(result['id'], result['question'], result['answer'])
                 qa_results[result['id']] = {
                     'question': result['question'],
@@ -310,7 +392,7 @@ elif items_needing_inference:
         
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             # Submit all inference tasks
-            future_to_item = {executor.submit(run_inference, item_info): item_info for item_info in items_needing_inference}
+            future_to_item = {executor.submit(run_inference, item): item for item in items_needing_inference}
             
             # Process completed tasks with progress tracking
             with tqdm(total=len(items_needing_inference), desc="Running inference", unit="item") as pbar:
@@ -330,7 +412,7 @@ elif items_needing_inference:
                             'Current': result['id'][:30] + '...' if len(result['id']) > 30 else result['id']
                         })
                     else:
-                        # Save full error trace to JSON
+                        # Save error message to JSON
                         save_answer_to_json(result['id'], result['question'], result['answer'])
                         qa_results[result['id']] = {
                             'question': result['question'],
