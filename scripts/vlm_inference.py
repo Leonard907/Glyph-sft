@@ -63,7 +63,7 @@ def vlm_inference(
     model_name: str = MODEL_NAME,
     max_pixels: int = MAX_PIXELS,
     max_tokens: int = 8192,
-    temperature: float = 0.0001,
+    temperature: float = 0.1,
     max_input_tokens: int = MAX_INPUT_TOKENS
 ) -> Optional[str]:
     """
@@ -94,24 +94,45 @@ def vlm_inference(
     question = question.strip() if question else ""
     
     # Build message content
+
+    # --- Block commented out: previous image truncation logic ---
+    # user_contents = []
+    # num_truncated_images = -1
+    # 
+    # # Add images if provided
+    # if image_paths:
+    #     total_image_tokens = 0
+    #     for image_path in image_paths:
+    #         image_path = image_path.strip()
+    #         if os.path.exists(image_path):
+    #             try:
+    #                 encoded = encode_image_with_max_pixels(image_path, max_pixels=max_pixels)
+    #                 encoded_img = f"data:image/png;base64,{encoded}"
+    #                 num_tokens = count_tokens_for_image(encoded_img)
+    #                 if total_image_tokens + num_tokens > max_input_tokens:
+    #                     print(f"Truncated {len(image_paths) - len(user_contents)} images to fit max tokens.")
+    #                     num_truncated_images = len(image_paths) - len(user_contents)
+    #                     break
+    #                 total_image_tokens += num_tokens
+    #                 user_contents.append({
+    #                     'type': 'image_url',
+    #                     'image_url': {"url": encoded_img}
+    #                 })
+    #             except Exception as e:
+    #                 print(f"Warning: Failed to encode image {image_path}: {e}")
+    #         else:
+    #             print(f"Warning: Image not found: {image_path}")
+
+    # --- Replacement: No truncation, always use all images (unless error or file missing) ---
     user_contents = []
-    num_truncated_images = -1
-    
     # Add images if provided
     if image_paths:
-        total_image_tokens = 0
         for image_path in image_paths:
             image_path = image_path.strip()
             if os.path.exists(image_path):
                 try:
                     encoded = encode_image_with_max_pixels(image_path, max_pixels=max_pixels)
                     encoded_img = f"data:image/png;base64,{encoded}"
-                    num_tokens = count_tokens_for_image(encoded_img)
-                    if total_image_tokens + num_tokens > max_input_tokens:
-                        print(f"Truncated {len(image_paths) - len(user_contents)} images to fit max tokens.")
-                        num_truncated_images = len(image_paths) - len(user_contents)
-                        break
-                    total_image_tokens += num_tokens
                     user_contents.append({
                         'type': 'image_url',
                         'image_url': {"url": encoded_img}
@@ -135,9 +156,6 @@ def vlm_inference(
         "top_k": 1,
         "temperature": temperature,
         "repetition_penalty": 1.1,
-        "skip_special_tokens": False,
-        "stop_token_ids": [151329, 151348, 151336],
-        "include_stop_str_in_output": True
     }
     
     headers = {
@@ -147,7 +165,7 @@ def vlm_inference(
     
     # Make API request
     try:
-        response = requests.post(api_url, headers=headers, data=json.dumps(payload), timeout=6000)
+        response = requests.post(api_url, headers=headers, data=json.dumps(payload), timeout=3600)
         
         # Check HTTP status
         if response.status_code != 200:
@@ -170,7 +188,7 @@ def vlm_inference(
             print(f"Missing content in response: {result}")
             return None
         
-        return result['choices'][0]['message']['content'] if num_truncated_images == -1 else f"(Truncated {num_truncated_images} images)\n" + result['choices'][0]['message']['content']
+        return result['choices'][0]['message']['content']
         
     except requests.exceptions.Timeout:
         print("Request timeout")

@@ -164,7 +164,8 @@ def run_inference(item_info):
             image_paths=item_info['image_paths'],
             api_url=f"http://localhost:{port}/v1/chat/completions",
             model_name=model,
-            max_input_tokens=max_input_tokens
+            max_input_tokens=max_input_tokens,
+            max_tokens=16384 if "thinking" in model.lower() else 8192
         )
         
         return {

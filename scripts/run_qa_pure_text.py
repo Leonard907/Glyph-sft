@@ -39,12 +39,6 @@ def parse_arguments():
         help='Maximum number of tokens in response (default: 8192)'
     )
     parser.add_argument(
-        '--temperature',
-        type=float,
-        default=0.0001,
-        help='Sampling temperature (default: 0.0001)'
-    )
-    parser.add_argument(
         '--max-input-tokens',
         type=int,
         default=None,
@@ -59,7 +53,6 @@ model = args.model
 mode = args.mode
 num_workers = args.workers
 max_tokens = args.max_tokens
-temperature = args.temperature
 max_input_tokens = args.max_input_tokens
 task = "loong_pure_text" # Hard code as QA task
 
@@ -196,6 +189,10 @@ def run_inference(item):
         payload = {
             "messages": messages,
             "max_tokens": max_tokens,
+            "temperature": 0.1,
+            "top_p": 1.0,
+            "top_k": 1,
+            "repetition_penalty": 1.1,
         }
         
         headers = {
