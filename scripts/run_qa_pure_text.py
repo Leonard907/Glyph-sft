@@ -60,7 +60,7 @@ task = "loong_pure_text" # Hard code as QA task
 INPUT_JSONL_FILE = './loong_process_100k.jsonl'  # Hard-coded input file
 
 MODEL_ID_MAPPING = {
-    "gemma3-12b": "google/gemma3-12b-it",
+    "gemma3-12b": "google/gemma-3-12b-it",
     "qwen3-8b": "Qwen/Qwen3-VL-8B-Instruct",
     "qwen3-30b": "Qwen/Qwen3-VL-30B-A3B-Instruct",
     "qwen3-30b-thinking": "Qwen/Qwen3-VL-30B-A3B-Thinking",
@@ -69,7 +69,7 @@ MODEL_ID_MAPPING = {
 }
 
 # Configuration
-OUTPUT_JSON_FILE = f'./results/{model}_{task}.json'
+OUTPUT_JSON_FILE = f'./results_{task}/{model}_{task}.json'
 MAX_WORKERS = num_workers
 
 # Load tokenizer if max_input_tokens is specified
