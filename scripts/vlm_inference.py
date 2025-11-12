@@ -105,13 +105,13 @@ def vlm_inference(
             image_path = image_path.strip()
             if os.path.exists(image_path):
                 try:
-                    # encoded = encode_image_with_max_pixels(image_path, max_pixels=max_pixels)
-                    # encoded_img = f"data:image/png;base64,{encoded}"
-                    # user_contents.append({
-                    #     'type': 'image_url',
-                    #     'image_url': {"url": encoded_img}
-                    # })
-                    user_contents.append({"type": "image_url", "image_url": {"url": image_path}})
+                    encoded = encode_image_with_max_pixels(image_path, max_pixels=max_pixels)
+                    encoded_img = f"data:image/png;base64,{encoded}"
+                    user_contents.append({
+                        'type': 'image_url',
+                        'image_url': {"url": encoded_img}
+                    })
+                    # user_contents.append({"type": "image_url", "image_url": {"url": image_path}})
                 except Exception as e:
                     print(f"Warning: Failed to encode image {image_path}: {e}")
             else:
