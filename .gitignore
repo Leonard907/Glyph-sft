@@ -1,2 +1,6 @@
 scripts/__pycache__/
 scripts/*images_dpi*/
+**/.ipynb_checkpoints/
+scripts/AlignScore-large.ckpt
+scripts/loong_process_100k.jsonl
+**/*.ipynb

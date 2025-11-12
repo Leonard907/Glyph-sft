@@ -62,6 +62,21 @@ render_only = args.render_only
 max_input_tokens = args.max_tokens
 task = "loong" # Hard code as QA task
 
+IMAGE_TOKENS = 259
+
+if "qwen" in model.lower():
+    if dpi == 72:
+        IMAGE_TOKENS = 470
+    elif dpi == 96:
+        IMAGE_TOKENS = 842
+elif "glyph" in model.lower():
+    if dpi == 72:
+        IMAGE_TOKENS = 632
+    elif dpi == 96:
+        IMAGE_TOKENS = 1122
+
+MAX_INPUT_IMAGES = max_input_tokens // IMAGE_TOKENS
+
 # Hard-coded input jsonl file path
 INPUT_JSONL_FILE = './loong_process_100k.jsonl'  # Hard-coded input file
 
@@ -165,7 +180,8 @@ def run_inference(item_info):
             api_url=f"http://localhost:{port}/v1/chat/completions",
             model_name=model,
             max_input_tokens=max_input_tokens,
-            max_tokens=16384 if "thinking" in model.lower() else 8192
+            max_tokens=16384 if "thinking" in model.lower() else 8192,
+            max_images=MAX_INPUT_IMAGES
         )
         
         return {
