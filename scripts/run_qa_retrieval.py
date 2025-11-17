@@ -140,6 +140,11 @@ def parse_arguments():
         default=10,
         help='Number of top retrieved document chunks per question (default: 10)'
     )
+    parser.add_argument(
+        '--retrieval-mode',
+        default='bm25',
+        help='Retrieval mode: bm25 or embedding (default: bm25)'
+    )
     return parser.parse_args()
 
 # Parse command line arguments
@@ -151,6 +156,7 @@ num_workers = args.workers
 dpi = args.dpi
 render_only = args.render_only
 max_input_tokens = args.max_tokens
+retrieval_mode = args.retrieval_mode
 topk = args.topk  # Allow topk from arg
 
 # Hardcoded retrieval hyperparameters
@@ -178,8 +184,8 @@ INPUT_JSONL_FILE = './loong_process_100k.jsonl'  # Hard-coded input file
 
 # Configuration
 CONFIG_EN_PATH = f'../config/config_en_dpi{dpi}.json'
-OUTPUT_BASE_DIR = f'./{task}_images_bm25_topk10_dpi{dpi}'
-OUTPUT_JSON_FILE = f'./results_{task}_retrieval/{model}_{task}_dpi{dpi}.json'
+OUTPUT_BASE_DIR = f'./{task}_images_{retrieval_mode}_topk{topk}_dpi{dpi}'
+OUTPUT_JSON_FILE = f'./results_{task}_retrieval/{model}_{task}_{retrieval_mode}_topk{topk}_dpi{dpi}.json'
 MAX_WORKERS = num_workers
 
 def load_jsonl(file_path):
@@ -242,7 +248,7 @@ def render_doc_images(item, item_index=None):
             chunks = chunk_doc(doc_text, tokenizer_name=tokenizer_name, chunk_size=chunk_size)
             
             # Step 2: Retrieve top-k chunks based on the question
-            retrieved_chunks = retrieve(question, chunks, topk=topk, mode="bm25")
+            retrieved_chunks = retrieve(question, chunks, topk=topk, mode=retrieval_mode)
             
             # Step 3: Aggregate retrieved chunks using the specified pattern
             aggregated_text = "\n---\n".join([f"Chunk {i+1}: {chunk_text}" for i, chunk_text in enumerate(retrieved_chunks)])
