@@ -3,6 +3,7 @@ import glob
 import json
 import argparse
 import traceback
+import requests
 import re
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,7 +12,47 @@ from rank_bm25 import BM25Okapi
 from typing import List
 from word2png_function import text_to_images
 from vlm_inference import vlm_inference
+import torch
 
+universal_header = {
+    "Content-Type": "application/json"
+}
+
+def get_embedding_from_endpoint(query: str, documents: List[str], workers: int = 10, endpoint: str = "http://localhost:6001/v1/embeddings") -> List[float]:
+    """
+    Get embeddings from the endpoint using the query and documents.
+    
+    Args:
+        query: Input query string
+        documents: List of documents to get embeddings for
+        batch_size: Batch size for the endpoint
+        endpoint: Endpoint to get embeddings from
+    """
+
+    # First get the query embedding
+    query_embedding_response = requests.post(endpoint, json={"input": query}, headers=universal_header)
+    query_embedding = query_embedding_response.json()['data'][0]['embedding']
+
+    # Then get the document embeddings
+    document_embeddings = [None] * len(documents)
+
+    def get_doc_embedding(idx_doc):
+        idx, doc = idx_doc
+        try:
+            response = requests.post(endpoint, json={"input": doc}, headers=universal_header)
+            embedding = response.json()['data'][0]['embedding']
+            return idx, embedding
+        except Exception as e:
+            print(f"Error retrieving embedding for document index {idx}: {e}")
+            return idx, None
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(get_doc_embedding, (i, doc)): i for i, doc in enumerate(documents)}
+        for future in as_completed(futures):
+            idx, embedding = future.result()
+            document_embeddings[idx] = embedding
+
+    return query_embedding, document_embeddings
 
 def chunk_doc(document: str, tokenizer_name: str = "Qwen/Qwen3-VL-8B-Instruct", chunk_size: int = 1024) -> List[str]:
     """
@@ -55,40 +96,68 @@ def retrieve(query: str, documents: List[str], topk: int = 10, mode: str = "bm25
     Returns:
         List of top-k documents in the original order they appear in the input
     """
-    if mode != "bm25":
+    if mode not in ["bm25", "embedding"]:
         raise ValueError(f"Mode '{mode}' not supported. Currently only 'bm25' is supported.")
     
     if not documents:
         return []
     
+    if mode == "bm25":
     # Tokenize documents and query for BM25
     # BM25 works with tokenized text, so we'll use simple word tokenization
-    def tokenize(text: str) -> List[str]:
-        # Simple tokenization: split on whitespace and punctuation
-        # Convert to lowercase for case-insensitive matching
-        tokens = re.findall(r'\b\w+\b', text.lower())
-        return tokens
-    
-    # Tokenize all documents
-    tokenized_docs = [tokenize(doc) for doc in documents]
-    
-    # Initialize BM25
-    bm25 = BM25Okapi(tokenized_docs)
-    
-    # Tokenize query
-    tokenized_query = tokenize(query)
-    
-    # Get BM25 scores for all documents
-    scores = bm25.get_scores(tokenized_query)
-    
-    # Get top-k indices (sorted by score in descending order)
-    topk_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:topk]
-    
-    # Sort indices to maintain original order
-    topk_indices_sorted = sorted(topk_indices)
-    
-    # Return documents in original order
-    retrieved_docs = [documents[i] for i in topk_indices_sorted]
+        def tokenize(text: str) -> List[str]:
+            # Simple tokenization: split on whitespace and punctuation
+            # Convert to lowercase for case-insensitive matching
+            tokens = re.findall(r'\b\w+\b', text.lower())
+            return tokens
+        
+        # Tokenize all documents
+        tokenized_docs = [tokenize(doc) for doc in documents]
+        
+        # Initialize BM25
+        bm25 = BM25Okapi(tokenized_docs)
+        
+        # Tokenize query
+        tokenized_query = tokenize(query)
+        
+        # Get BM25 scores for all documents
+        scores = bm25.get_scores(tokenized_query)
+        
+        # Get top-k indices (sorted by score in descending order)
+        topk_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:topk]
+        
+        # Sort indices to maintain original order
+        topk_indices_sorted = sorted(topk_indices)
+        
+        # Return documents in original order
+        retrieved_docs = [documents[i] for i in topk_indices_sorted]
+    elif mode == "embedding":
+        query_embedding, document_embeddings = get_embedding_from_endpoint(query, documents, endpoint=endpoint)
+        valid_indices = [i for i, emb in enumerate(document_embeddings) if emb is not None]
+        valid_embeddings = [document_embeddings[i] for i in valid_indices]
+        
+        if not valid_embeddings:
+            return []
+        
+        # Convert to torch tensors
+        query_tensor = torch.tensor(query_embedding, dtype=torch.float32)
+        doc_tensor = torch.tensor(valid_embeddings, dtype=torch.float32)
+        
+        # Compute dot product scores
+        scores = torch.matmul(doc_tensor, query_tensor)
+        
+        # Get top-k indices (sorted by score in descending order)
+        topk_actual = min(topk, len(valid_indices))
+        topk_values, topk_relative_indices = torch.topk(scores, topk_actual, largest=True)
+        
+        # Map back to original document indices
+        topk_indices = [valid_indices[i] for i in topk_relative_indices.tolist()]
+        
+        # Sort indices to maintain original order
+        topk_indices_sorted = sorted(topk_indices)
+        
+        # Return documents in original order
+        retrieved_docs = [documents[i] for i in topk_indices_sorted]
     
     return retrieved_docs
 
