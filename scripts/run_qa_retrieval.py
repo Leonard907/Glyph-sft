@@ -178,7 +178,7 @@ INPUT_JSONL_FILE = './loong_process_100k.jsonl'  # Hard-coded input file
 
 # Configuration
 CONFIG_EN_PATH = f'../config/config_en_dpi{dpi}.json'
-OUTPUT_BASE_DIR = f'./{task}_images_dpi{dpi}'
+OUTPUT_BASE_DIR = f'./{task}_images_bm25_topk10_dpi{dpi}'
 OUTPUT_JSON_FILE = f'./results_{task}_retrieval/{model}_{task}_dpi{dpi}.json'
 MAX_WORKERS = num_workers
 
