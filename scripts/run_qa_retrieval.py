@@ -131,7 +131,7 @@ def parse_arguments():
     parser.add_argument(
         '--max-tokens',
         type=int,
-        default=256000,
+        default=120000,
         help='Maximum number of input tokens when truncating images (default: 256000)'
     )
     parser.add_argument(
