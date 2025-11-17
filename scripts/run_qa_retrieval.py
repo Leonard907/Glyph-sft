@@ -42,14 +42,14 @@ def chunk_doc(document: str, tokenizer_name: str = "Qwen/Qwen3-VL-8B-Instruct", 
     return chunks
 
 
-def retrieve(query: str, documents: List[str], topk: int = 5, mode: str = "bm25") -> List[str]:
+def retrieve(query: str, documents: List[str], topk: int = 10, mode: str = "bm25") -> List[str]:
     """
     Retrieve top-k documents based on a query using BM25.
     
     Args:
         query: Input query string
         documents: List of documents to search through
-        topk: Number of top documents to retrieve (default: 5)
+        topk: Number of top documents to retrieve (default: 10)
         mode: Retrieval mode, currently only "bm25" is supported (default: "bm25")
     
     Returns:
@@ -134,6 +134,12 @@ def parse_arguments():
         default=256000,
         help='Maximum number of input tokens when truncating images (default: 256000)'
     )
+    parser.add_argument(
+        '--topk',
+        type=int,
+        default=10,
+        help='Number of top retrieved document chunks per question (default: 10)'
+    )
     return parser.parse_args()
 
 # Parse command line arguments
@@ -145,10 +151,10 @@ num_workers = args.workers
 dpi = args.dpi
 render_only = args.render_only
 max_input_tokens = args.max_tokens
+topk = args.topk  # Allow topk from arg
 
 # Hardcoded retrieval hyperparameters
 chunk_size = 1024
-topk = 5
 tokenizer_name = "Qwen/Qwen3-VL-8B-Instruct"
 task = "loong" # Hard code as QA task
 
