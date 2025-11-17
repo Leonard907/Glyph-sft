@@ -134,24 +134,6 @@ def parse_arguments():
         default=256000,
         help='Maximum number of input tokens when truncating images (default: 256000)'
     )
-    parser.add_argument(
-        '--chunk-size',
-        type=int,
-        default=1024,
-        help='Chunk size in tokens for document chunking (default: 1024)'
-    )
-    parser.add_argument(
-        '--topk',
-        type=int,
-        default=5,
-        help='Number of top chunks to retrieve (default: 5)'
-    )
-    parser.add_argument(
-        '--tokenizer-name',
-        type=str,
-        default="Qwen/Qwen3-VL-8B-Instruct",
-        help='Tokenizer name for chunking (default: Qwen/Qwen3-VL-8B-Instruct)'
-    )
     return parser.parse_args()
 
 # Parse command line arguments
@@ -163,9 +145,11 @@ num_workers = args.workers
 dpi = args.dpi
 render_only = args.render_only
 max_input_tokens = args.max_tokens
-chunk_size = args.chunk_size
-topk = args.topk
-tokenizer_name = args.tokenizer_name
+
+# Hardcoded retrieval hyperparameters
+chunk_size = 1024
+topk = 5
+tokenizer_name = "Qwen/Qwen3-VL-8B-Instruct"
 task = "loong" # Hard code as QA task
 
 IMAGE_TOKENS = 259
@@ -492,4 +476,3 @@ print("=" * 80)
 print(f"Total items in dataset: {len(dt)}")
 print(f"Total answers in output file: {len(qa_results)}")
 print(f"All answers saved to: {OUTPUT_JSON_FILE}")
-
