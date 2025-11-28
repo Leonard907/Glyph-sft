@@ -49,6 +49,8 @@ def load_config(config_path):
         config['para-bg-color'] = colors.HexColor(config['para-bg-color'])
     if 'para-border-color' in config and isinstance(config['para-border-color'], str):
         config['para-border-color'] = colors.HexColor(config['para-border-color'])
+    if 'highlight-color' in config and isinstance(config['highlight-color'], str):
+        config['highlight-color'] = colors.HexColor(config['highlight-color'])
     
     # Convert alignment
     if 'alignment' in config and isinstance(config['alignment'], str):
@@ -61,7 +63,59 @@ def load_config(config_path):
     return config
 
 
-def text_to_images(text, output_dir, config_path=None, config_dict=None, unique_id=None):
+def apply_highlight_ranges(text, highlight_ranges, highlight_color='#FF0000'):
+    """
+    Apply color highlighting to specific character ranges in text
+    
+    Args:
+        text: Original text string
+        highlight_ranges: List of tuples [(start, end), ...] where start and end are character indices
+        highlight_color: Color to apply (default red)
+        
+    Returns:
+        Text with HTML markup for highlighting
+    """
+    if not highlight_ranges:
+        return text
+    
+    # Sort ranges by start position
+    sorted_ranges = sorted(highlight_ranges, key=lambda x: x[0])
+    
+    # Validate and merge overlapping ranges
+    merged_ranges = []
+    for start, end in sorted_ranges:
+        if start < 0 or end > len(text) or start >= end:
+            continue  # Skip invalid ranges
+        
+        if merged_ranges and start <= merged_ranges[-1][1]:
+            # Merge overlapping ranges
+            merged_ranges[-1] = (merged_ranges[-1][0], max(merged_ranges[-1][1], end))
+        else:
+            merged_ranges.append((start, end))
+    
+    # Build result string with markup
+    result_parts = []
+    last_pos = 0
+    
+    for start, end in merged_ranges:
+        # Add text before highlight
+        if start > last_pos:
+            result_parts.append(escape(text[last_pos:start]))
+        
+        # Add highlighted text
+        highlighted_text = escape(text[start:end])
+        result_parts.append(f'<font color="{highlight_color}">{highlighted_text}</font>')
+        
+        last_pos = end
+    
+    # Add remaining text
+    if last_pos < len(text):
+        result_parts.append(escape(text[last_pos:]))
+    
+    return ''.join(result_parts)
+
+
+def text_to_images(text, output_dir, config_path=None, config_dict=None, unique_id=None, highlight_ranges=None):
     """
     Convert text to images - Inference interface
     
@@ -71,6 +125,7 @@ def text_to_images(text, output_dir, config_path=None, config_dict=None, unique_
         config_path: Configuration file path (optional)
         config_dict: Configuration dictionary (optional, higher priority than config_path)
         unique_id: Unique identifier (optional, auto-generated if not provided)
+        highlight_ranges: List of character index ranges to highlight [(start, end), ...]
         
     Returns:
         list: List of generated image paths
@@ -79,7 +134,8 @@ def text_to_images(text, output_dir, config_path=None, config_dict=None, unique_
         >>> images = text_to_images(
         ...     text="Hello World",
         ...     output_dir="./output",
-        ...     config_path="config.json"
+        ...     config_path="config.json",
+        ...     highlight_ranges=[(0, 5)]  # Highlight "Hello"
         ... )
         >>> print(images)  # ['./output/xxx/page_001.png', ...]
     """
@@ -99,6 +155,8 @@ def text_to_images(text, output_dir, config_path=None, config_dict=None, unique_
             config['para-bg-color'] = colors.HexColor(config['para-bg-color'])
         if 'para-border-color' in config and isinstance(config['para-border-color'], str):
             config['para-border-color'] = colors.HexColor(config['para-border-color'])
+        if 'highlight-color' in config and isinstance(config['highlight-color'], str):
+            config['highlight-color'] = colors.HexColor(config['highlight-color'])
         if 'alignment' in config and isinstance(config['alignment'], str):
             config['alignment'] = ALIGN_MAP.get(config['alignment'], TA_JUSTIFY)
         if 'page-size' in config and isinstance(config['page-size'], str):
@@ -124,6 +182,7 @@ def text_to_images(text, output_dir, config_path=None, config_dict=None, unique_
     font_color = config.get('font-color', colors.HexColor('#000000'))
     para_bg_color = config.get('para-bg-color', colors.HexColor('#FFFFFF'))
     para_border_color = config.get('para-border-color', colors.HexColor('#FFFFFF'))
+    highlight_color = config.get('highlight-color', '#FF0000')
     
     first_line_indent = config.get('first-line-indent', 0)
     left_indent = config.get('left-indent', 0)
@@ -138,7 +197,6 @@ def text_to_images(text, output_dir, config_path=None, config_dict=None, unique_
     dpi = config.get('dpi', 72)
     auto_crop_last_page = config.get('auto-crop-last-page', False)
     auto_crop_width = config.get('auto-crop-width', False)
-    # newline_markup = config.get('newline-markup', '<font color="#FF0000"> \\n </font>')
     newline_markup = config.get('newline-markup', '<br/>')
     
     # Register font
@@ -182,20 +240,91 @@ def text_to_images(text, output_dir, config_path=None, config_dict=None, unique_
         spaceAfter=space_after,
     )
     
-    # Process text
-    def replace_spaces(s):
-        return re.sub(r' {2,}', lambda m: '&nbsp;'*len(m.group()), s)
-    
+    # Process text with highlighting
     text = text.replace('\xad', '').replace('\u200b', '')
-    processed_text = replace_spaces(escape(text))
+    
+    # Apply highlighting if ranges provided
+    if highlight_ranges:
+        processed_text = apply_highlight_ranges(text, highlight_ranges, highlight_color)
+    else:
+        processed_text = escape(text)
+    
+    # Replace multiple spaces
+    def replace_spaces(s):
+        # Don't replace spaces inside font tags
+        parts = re.split(r'(<font[^>]*>.*?</font>)', s)
+        result = []
+        for part in parts:
+            if part.startswith('<font'):
+                result.append(part)
+            else:
+                result.append(re.sub(r' {2,}', lambda m: '&nbsp;'*len(m.group()), part))
+        return ''.join(result)
+    
+    processed_text = replace_spaces(processed_text)
     parts = processed_text.split('\n')
     
     # Create paragraphs in batches
     story = []
     turns = 30
+    def balance_font_tags(text):
+        """
+        Properly balance font tags by tracking the stack of open tags.
+        Handles cases where tags are improperly nested or closed.
+        """
+        stack = []
+        result = []
+        i = 0
+        
+        while i < len(text):
+            # Check for opening font tag
+            font_open = re.match(r'<font[^>]*>', text[i:])
+            if font_open:
+                tag = font_open.group(0)
+                stack.append(tag)
+                result.append(tag)
+                i += len(tag)
+                continue
+            
+            # Check for closing font tag
+            font_close = re.match(r'</font>', text[i:])
+            if font_close:
+                if stack:
+                    stack.pop()
+                    result.append('</font>')
+                else:
+                    # Closing tag without opening - extract color and add opening tag
+                    result.insert(0, '<font color="#FF0000">')
+                    result.append('</font>')
+                i += len(font_close.group(0))
+                continue
+            
+            # Regular character
+            result.append(text[i])
+            i += 1
+        
+        # Close any remaining unclosed tags
+        while stack:
+            result.append('</font>')
+            stack.pop()
+        
+        return ''.join(result)
+
+
+    # Use in your loop:
     for i in range(0, len(parts), turns):
         tmp_text = newline_markup.join(parts[i:i+turns])
-        story.append(Paragraph(tmp_text, custom))
+        
+        # Balance font tags properly
+        tmp_text = balance_font_tags(tmp_text)
+        
+        try:
+            story.append(Paragraph(tmp_text, custom))
+        except Exception as e:
+            print(f"Error creating paragraph: {e}")
+            print(f"Text snippet: {tmp_text[:200]}...")
+            # Optionally use pdb for debugging
+            # import pdb; pdb.set_trace()
     
     # Build PDF
     doc.build(
@@ -290,19 +419,24 @@ def process_one(item):
         config['para-bg-color'] = colors.HexColor(item_config['para-bg-color'])
     if 'para-border-color' in item_config and isinstance(item_config['para-border-color'], str):
         config['para-border-color'] = colors.HexColor(item_config['para-border-color'])
+    if 'highlight-color' in item_config and isinstance(item_config['highlight-color'], str):
+        config['highlight-color'] = colors.HexColor(item_config['highlight-color'])
     if 'alignment' in item_config and isinstance(item_config['alignment'], str):
         config['alignment'] = ALIGN_MAP.get(item_config['alignment'], TA_JUSTIFY)
     
-    # Get text
+    # Get text and highlight ranges
     text = item.get('context', '')
     assert text
+    
+    highlight_ranges = item.get('highlight_ranges', None)
     
     # Call inference function
     image_paths = text_to_images(
         text=text,
         output_dir=OUTPUT_DIR,
         config_dict=config,
-        unique_id=_id
+        unique_id=_id,
+        highlight_ranges=highlight_ranges
     )
     
     item['image_paths'] = image_paths
@@ -383,21 +517,27 @@ def batch_process_to_images(json_path, output_dir, output_jsonl_path,
 
 
 if __name__ == '__main__':
-    # Example 1: Single text inference
-    CONFIG_PATH = '../config/config.json'
-    text = "This is a test text\nSecond line of text\nThird line of text"
+    # Example 1: Single text inference with highlighting
+    CONFIG_PATH = '/mnt/lituou/Glyph-sft/config/config_en_dpi72.json'
+    text = open('input.txt', 'r').read()
     OUTPUT_DIR = './output_images'
+    
+    # Highlight "test" (characters 10-14) and "Second" (characters 20-26)
+    highlight_ranges = []
+    
     images = text_to_images(
         text=text,
         output_dir=OUTPUT_DIR,
         config_path=CONFIG_PATH,
-        unique_id='test_001'
+        unique_id='test_001',
+        highlight_ranges=highlight_ranges
     )
     print(f"Generated {len(images)} images:")
     for img in images:
         print(f"  {img}")
     
-    # Example 2: Batch processing
+    # Example 2: Batch processing with highlighting
+    # Each item in JSON can have a "highlight_ranges" field: [[start1, end1], [start2, end2], ...]
     # CONFIG_PATH = '../config/config.json'
     # JSON_PATH = '../evaluation/mrcr/data/processed_2needle_0-128k.json'
     # OUTPUT_JSONL_PATH = '../evaluation/mrcr/data/processed_2needle_0-128k.jsonl'
@@ -412,5 +552,3 @@ if __name__ == '__main__':
     #     is_recover=True,
     #     batch_size=100
     # )
-
-

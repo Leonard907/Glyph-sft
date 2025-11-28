@@ -1,0 +1,681 @@
+import os
+import glob
+import json
+import argparse
+import traceback
+import requests
+import re
+from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from transformers import AutoTokenizer
+from rank_bm25 import BM25Okapi
+from typing import List, Tuple
+from word2png_function import text_to_images
+from vlm_inference import vlm_inference
+import torch
+
+universal_header = {
+    "Content-Type": "application/json"
+}
+
+HIGHLIGHT_HINT = "Important: To help you answer the question, I have highlighted texts potentially relevant to the question in red. Pay special attention to these texts when answering the question as they may contain important information."
+
+def get_embedding_from_endpoint(query: str, documents: List[str], workers: int = 10, endpoint: str = "http://localhost:6001/v1/embeddings") -> List[float]:
+    """
+    Get embeddings from the endpoint using the query and documents.
+    
+    Args:
+        query: Input query string
+        documents: List of documents to get embeddings for
+        batch_size: Batch size for the endpoint
+        endpoint: Endpoint to get embeddings from
+    """
+
+    # First get the query embedding
+    query_embedding_response = requests.post(endpoint, json={"input": query}, headers=universal_header)
+    query_embedding = query_embedding_response.json()['data'][0]['embedding']
+
+    # Then get the document embeddings
+    document_embeddings = [None] * len(documents)
+
+    def get_doc_embedding(idx_doc):
+        idx, doc = idx_doc
+        try:
+            response = requests.post(endpoint, json={"input": doc}, headers=universal_header)
+            embedding = response.json()['data'][0]['embedding']
+            return idx, embedding
+        except Exception as e:
+            print(f"Error retrieving embedding for document index {idx}: {e}")
+            return idx, None
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(get_doc_embedding, (i, doc)): i for i, doc in enumerate(documents)}
+        for future in as_completed(futures):
+            idx, embedding = future.result()
+            document_embeddings[idx] = embedding
+
+    return query_embedding, document_embeddings
+
+def chunk_doc(document: str, tokenizer_name: str = "Qwen/Qwen3-VL-8B-Instruct", chunk_size: int = 1024) -> List[str]:
+    """
+    Chunk a document into fixed-size token chunks with no overlap.
+    
+    Args:
+        document: Input document text to chunk
+        tokenizer_name: HuggingFace tokenizer name (default: "Qwen/Qwen3-VL-8B-Instruct")
+        chunk_size: Maximum number of tokens per chunk (default: 1024)
+    
+    Returns:
+        List of document chunks as strings
+    """
+    # Initialize tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    
+    # Tokenize the entire document
+    tokens = tokenizer.encode(document, add_special_tokens=False)
+    
+    chunks = []
+    # Split tokens into chunks of size chunk_size with no overlap
+    for i in range(0, len(tokens), chunk_size):
+        chunk_tokens = tokens[i:i + chunk_size]
+        # Decode the chunk back to text
+        chunk_text = tokenizer.decode(chunk_tokens, skip_special_tokens=True)
+        chunks.append(chunk_text)
+    
+    return chunks
+
+
+def retrieve_with_indices(query: str, documents: List[str], topk: int = 10, mode: str = "bm25", endpoint: str = "http://localhost:6001/v1/embeddings") -> Tuple[List[str], List[int]]:
+    """
+    Retrieve top-k documents based on a query and return both documents and their indices.
+    
+    Args:
+        query: Input query string
+        documents: List of documents to search through
+        topk: Number of top documents to retrieve (default: 10)
+        mode: Retrieval mode: "bm25" or "embedding" (default: "bm25")
+        endpoint: Endpoint for embedding retrieval (only used in embedding mode)
+    
+    Returns:
+        Tuple of (retrieved_documents, retrieved_indices) where both are in original order
+    """
+    if mode not in ["bm25", "embedding"]:
+        raise ValueError(f"Mode '{mode}' not supported. Currently only 'bm25' and 'embedding' are supported.")
+    
+    if not documents:
+        return [], []
+    
+    if mode == "bm25":
+        # Tokenize documents and query for BM25
+        # BM25 works with tokenized text, so we'll use simple word tokenization
+        def tokenize(text: str) -> List[str]:
+            # Simple tokenization: split on whitespace and punctuation
+            # Convert to lowercase for case-insensitive matching
+            tokens = re.findall(r'\b\w+\b', text.lower())
+            return tokens
+        
+        # Tokenize all documents
+        tokenized_docs = [tokenize(doc) for doc in documents]
+        
+        # Initialize BM25
+        bm25 = BM25Okapi(tokenized_docs)
+        
+        # Tokenize query
+        tokenized_query = tokenize(query)
+        
+        # Get BM25 scores for all documents
+        scores = bm25.get_scores(tokenized_query)
+        
+        # Get top-k indices (sorted by score in descending order)
+        topk_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:topk]
+        
+        # Sort indices to maintain original order
+        topk_indices_sorted = sorted(topk_indices)
+        
+        # Return documents and indices in original order
+        retrieved_docs = [documents[i] for i in topk_indices_sorted]
+        return retrieved_docs, topk_indices_sorted
+        
+    elif mode == "embedding":
+        query_embedding, document_embeddings = get_embedding_from_endpoint(query, documents, endpoint=endpoint)
+        valid_indices = [i for i, emb in enumerate(document_embeddings) if emb is not None]
+        valid_embeddings = [document_embeddings[i] for i in valid_indices]
+        
+        if not valid_embeddings:
+            return [], []
+        
+        # Convert to torch tensors
+        query_tensor = torch.tensor(query_embedding, dtype=torch.float32)
+        doc_tensor = torch.tensor(valid_embeddings, dtype=torch.float32)
+        
+        # Compute dot product scores
+        scores = torch.matmul(doc_tensor, query_tensor)
+        
+        # Get top-k indices (sorted by score in descending order)
+        topk_actual = min(topk, len(valid_indices))
+        topk_values, topk_relative_indices = torch.topk(scores, topk_actual, largest=True)
+        
+        # Map back to original document indices
+        topk_indices = [valid_indices[i] for i in topk_relative_indices.tolist()]
+        
+        # Sort indices to maintain original order
+        topk_indices_sorted = sorted(topk_indices)
+        
+        # Return documents and indices in original order
+        retrieved_docs = [documents[i] for i in topk_indices_sorted]
+        return retrieved_docs, topk_indices_sorted
+
+
+def find_chunk_positions(chunk_text: str, document: str) -> List[Tuple[int, int]]:
+    """
+    Find all occurrences of a chunk text in the original document.
+    Returns list of (start, end) character positions.
+    
+    Args:
+        chunk_text: The chunk text to find
+        document: The original document text
+    
+    Returns:
+        List of (start, end) tuples for all occurrences
+    """
+    positions = []
+    
+    # Clean chunk text - remove leading/trailing whitespace for matching
+    chunk_clean = chunk_text.strip()
+    if not chunk_clean:
+        return []
+    
+    # Try to find exact match first
+    idx = document.find(chunk_clean)
+    if idx != -1:
+        positions.append((idx, idx + len(chunk_clean)))
+        return positions
+    
+    # If exact match fails, try to find using a significant substring
+    # This handles cases where tokenization/decoding might have slight differences
+    chunk_words = chunk_clean.split()
+    if len(chunk_words) >= 3:
+        # Use first 3-5 words as anchor for more reliable matching
+        search_words = chunk_words[:min(5, len(chunk_words))]
+        search_text = ' '.join(search_words)
+        idx = document.find(search_text)
+        if idx != -1:
+            # Estimate the chunk position
+            # Start from the found position and estimate length
+            estimated_length = len(chunk_clean)
+            end_pos = min(idx + estimated_length, len(document))
+            positions.append((idx, end_pos))
+            return positions
+    
+    # If still not found, try with just first word (less reliable but better than nothing)
+    if len(chunk_words) >= 1:
+        first_word = chunk_words[0]
+        if len(first_word) >= 3:  # Only if word is substantial
+            idx = document.find(first_word)
+            if idx != -1:
+                # Estimate position based on chunk length
+                estimated_length = len(chunk_clean)
+                end_pos = min(idx + estimated_length, len(document))
+                positions.append((idx, end_pos))
+                return positions
+    
+    # If still not found, return empty list
+    return positions
+
+
+def calculate_highlight_ranges(document: str, chunks: List[str], retrieved_indices: List[int]) -> List[Tuple[int, int]]:
+    """
+    Calculate character ranges for highlighting retrieved chunks in the original document.
+    
+    Args:
+        document: The original full document text
+        chunks: List of all chunks
+        retrieved_indices: List of indices of retrieved chunks
+    
+    Returns:
+        List of (start, end) character position tuples for highlighting
+    """
+    highlight_ranges = []
+    
+    for chunk_idx in retrieved_indices:
+        if chunk_idx < 0 or chunk_idx >= len(chunks):
+            continue
+        
+        chunk_text = chunks[chunk_idx]
+        positions = find_chunk_positions(chunk_text, document)
+        
+        if positions:
+            # Use the first occurrence found
+            highlight_ranges.append(positions[0])
+        else:
+            # If exact match not found, try a more flexible approach
+            # Find the chunk by searching for a significant substring
+            chunk_words = chunk_text.strip().split()
+            if len(chunk_words) >= 3:
+                # Use first 3 words as anchor
+                search_anchor = ' '.join(chunk_words[:3])
+                anchor_pos = document.find(search_anchor)
+                if anchor_pos != -1:
+                    # Estimate the chunk position
+                    # Try to find a reasonable end position
+                    estimated_length = len(chunk_text)
+                    end_pos = min(anchor_pos + estimated_length, len(document))
+                    highlight_ranges.append((anchor_pos, end_pos))
+    
+    # Sort and merge overlapping ranges
+    if not highlight_ranges:
+        return []
+    
+    sorted_ranges = sorted(highlight_ranges, key=lambda x: x[0])
+    merged_ranges = []
+    
+    for start, end in sorted_ranges:
+        if not merged_ranges:
+            merged_ranges.append((start, end))
+        else:
+            last_start, last_end = merged_ranges[-1]
+            if start <= last_end:
+                # Merge overlapping ranges
+                merged_ranges[-1] = (last_start, max(last_end, end))
+            else:
+                merged_ranges.append((start, end))
+    
+    return merged_ranges
+
+
+def parse_arguments():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description="Process QA dataset with retrieval, text-to-image rendering with highlighting and VLM question answering")
+    parser.add_argument(
+        '--mode', 
+        choices=['sequential', 'concurrent'], 
+        default='concurrent',
+        help='Processing mode for inference: sequential or concurrent (default: concurrent)'
+    )
+    parser.add_argument(
+        '--workers',
+        type=int,
+        default=30,
+        help='Number of concurrent workers for inference (only used in concurrent mode, default: 30)'
+    )
+    parser.add_argument(
+        '--model',
+        type=str,
+        help='Model to use for processing'
+    )
+    parser.add_argument(
+        '--port',
+        type=str,
+        help='Port number for the service'
+    )
+    parser.add_argument(
+        '--dpi',
+        type=int,
+        default=72
+    )
+    parser.add_argument(
+        '--render-only',
+        action='store_true',
+        help='Only render images without running inference'
+    )
+    parser.add_argument(
+        '--max-tokens',
+        type=int,
+        default=120000,
+        help='Maximum number of input tokens when truncating images (default: 120000)'
+    )
+    parser.add_argument(
+        '--topk',
+        type=int,
+        default=10,
+        help='Number of top retrieved document chunks per question (default: 10)'
+    )
+    parser.add_argument(
+        '--retrieval-mode',
+        default='bm25',
+        help='Retrieval mode: bm25 or embedding (default: bm25)'
+    )
+    parser.add_argument(
+        '--embedding-endpoint',
+        type=str,
+        default='http://localhost:6001/v1/embeddings',
+        help='Endpoint for embedding retrieval (default: http://localhost:6001/v1/embeddings)'
+    )
+    return parser.parse_args()
+
+# Parse command line arguments
+args = parse_arguments()
+port = args.port
+model = args.model
+mode = args.mode
+num_workers = args.workers
+dpi = args.dpi
+render_only = args.render_only
+max_input_tokens = args.max_tokens
+retrieval_mode = args.retrieval_mode
+topk = args.topk
+embedding_endpoint = args.embedding_endpoint
+
+# Hardcoded retrieval hyperparameters
+chunk_size = 1024
+tokenizer_name = "Qwen/Qwen3-VL-8B-Instruct"
+task = "loong" # Hard code as QA task
+
+IMAGE_TOKENS = 259
+
+if model and "qwen" in model.lower():
+    if dpi == 72:
+        IMAGE_TOKENS = 470
+    elif dpi == 96:
+        IMAGE_TOKENS = 842
+elif model and "glyph" in model.lower():
+    if dpi == 72:
+        IMAGE_TOKENS = 632
+    elif dpi == 96:
+        IMAGE_TOKENS = 1122
+
+MAX_INPUT_IMAGES = max_input_tokens // IMAGE_TOKENS
+
+# Hard-coded input jsonl file path
+INPUT_JSONL_FILE = './loong_process_100k.jsonl'  # Hard-coded input file
+
+# Configuration
+CONFIG_EN_PATH = f'../config/config_en_dpi{dpi}.json'
+OUTPUT_BASE_DIR = f'./{task}_images_{retrieval_mode}_topk{topk}_dpi{dpi}_highlight'
+OUTPUT_JSON_FILE = f'./results_{task}_retrieval/{model}_{task}_{retrieval_mode}_topk{topk}_dpi{dpi}_highlight.json'
+MAX_WORKERS = num_workers
+
+def load_jsonl(file_path):
+    """Load data from jsonl file"""
+    items = []
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Input file not found: {file_path}")
+    
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+                # Validate required fields
+                if 'final_question' not in item:
+                    print(f"Warning: Item at line {line_num} missing 'final_question', skipping")
+                    continue
+                if 'docs' not in item:
+                    print(f"Warning: Item at line {line_num} missing 'docs', skipping")
+                    continue
+                # Add index as unique identifier if not present
+                if 'id' not in item:
+                    item['id'] = f"item_{line_num}"
+                items.append(item)
+            except json.JSONDecodeError as e:
+                print(f"Warning: Failed to parse line {line_num}: {e}")
+                continue
+    
+    return items
+
+def render_doc_images(item, item_index=None):
+    """Render full document with retrieved chunks highlighted in red"""
+    doc_text = item['docs']
+    item_id = item.get('id', f"item_{item_index if item_index is not None else 'unknown'}")
+    question = item.get('final_question', '')
+    
+    # Clean item ID for use as directory name
+    safe_id = "".join(c for c in str(item_id) if c.isalnum() or c in (' ', '-', '_')).rstrip()
+    safe_id = safe_id.replace(' ', '_')
+    
+    doc_image_dir = os.path.join(OUTPUT_BASE_DIR, safe_id)
+    
+    # Check if images are already rendered
+    if os.path.exists(doc_image_dir) and os.listdir(doc_image_dir):
+        image_paths = glob.glob(os.path.join(doc_image_dir, '*.png'))
+        return {
+            'id': item_id,
+            'question': question,
+            'safe_id': safe_id,
+            'image_paths': sorted(image_paths),
+            'success': True,
+            'error': None,
+            'skipped': True
+        }
+    else:
+        # Step 1: Chunk the document
+        chunks = chunk_doc(doc_text, tokenizer_name=tokenizer_name, chunk_size=chunk_size)
+        
+        # Step 2: Retrieve top-k chunks based on the question (get both chunks and indices)
+        retrieved_chunks, retrieved_indices = retrieve_with_indices(
+            question, chunks, topk=topk, mode=retrieval_mode, endpoint=embedding_endpoint
+        )
+        
+        # Step 3: Calculate highlight ranges for retrieved chunks in the original document
+        highlight_ranges = calculate_highlight_ranges(doc_text, chunks, retrieved_indices)
+        # Step 4: Render the FULL document with retrieved parts highlighted in red
+        # import pdb; pdb.set_trace()
+        image_paths = text_to_images(
+            text=doc_text, 
+            output_dir=OUTPUT_BASE_DIR, 
+            config_path=CONFIG_EN_PATH, 
+            unique_id=safe_id, 
+            highlight_ranges=highlight_ranges
+        )
+        
+        return {
+            'id': item_id,
+            'question': question + "\n\n" + HIGHLIGHT_HINT,
+            'safe_id': safe_id,
+            'image_paths': sorted(image_paths),
+            'success': True,
+            'error': None,
+            'skipped': False,
+            'highlight_ranges': highlight_ranges  # Store for debugging
+        }
+
+def run_inference(item_info):
+    """Run VLM inference on rendered document images"""
+    try:
+        answer = vlm_inference(
+            question=item_info['question'],
+            image_paths=item_info['image_paths'],
+            api_url=f"http://localhost:{port}/v1/chat/completions",
+            model_name=model,
+            max_input_tokens=max_input_tokens,
+            max_tokens=16384 if "thinking" in model.lower() else 8192,
+            max_images=MAX_INPUT_IMAGES
+        )
+        
+        return {
+            'id': item_info['id'],
+            'question': item_info['question'],
+            'answer': answer,
+            'success': True,
+            'error': None
+        }
+        
+    except Exception as e:
+        error_trace = traceback.format_exc()
+        return {
+            'id': item_info['id'],
+            'question': item_info['question'],
+            'answer': f"Image Inference Error: {error_trace}",
+            'success': False,
+            'error': error_trace  # Use full error trace for output
+        }
+
+# Create base output directory if it doesn't exist
+os.makedirs(OUTPUT_BASE_DIR, exist_ok=True)
+os.makedirs(os.path.dirname(OUTPUT_JSON_FILE), exist_ok=True)
+
+# Load input data from jsonl file
+print(f"Loading data from {INPUT_JSONL_FILE}...")
+dt = load_jsonl(INPUT_JSONL_FILE)
+print(f"Loaded {len(dt)} items from {INPUT_JSONL_FILE}")
+
+# Load existing answers if output file exists
+qa_results = {}
+
+if os.path.exists(OUTPUT_JSON_FILE):
+    try:
+        with open(OUTPUT_JSON_FILE, 'r', encoding='utf-8') as f:
+            qa_results = json.load(f)
+        print(f"Loaded {len(qa_results)} existing answers from {OUTPUT_JSON_FILE}")
+    except (json.JSONDecodeError, FileNotFoundError):
+        print(f"Could not load existing answers from {OUTPUT_JSON_FILE}, starting fresh")
+        qa_results = {}
+else:
+    print(f"No existing result file found, creating new {OUTPUT_JSON_FILE}")
+    # Initialize empty JSON file
+    with open(OUTPUT_JSON_FILE, 'w', encoding='utf-8') as f:
+        json.dump({}, f)
+
+def save_answer_to_json(item_id, question, answer):
+    """Thread-safe function to save a single answer to JSON file"""
+    # Load existing results
+    try:
+        with open(OUTPUT_JSON_FILE, 'r', encoding='utf-8') as f:
+            existing_results = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        existing_results = {}
+    
+    # Add new answer
+    existing_results[item_id] = {
+        'question': question,
+        'answer': answer
+    }
+    
+    # Save back to file
+    with open(OUTPUT_JSON_FILE, 'w', encoding='utf-8') as f:
+        json.dump(existing_results, f, indent=2, ensure_ascii=False)
+
+# PHASE 1: Render all images sequentially
+print("=" * 80)
+print("PHASE 1: RENDERING IMAGES WITH HIGHLIGHTING (Sequential)")
+print("=" * 80)
+
+items_needing_inference = []
+rendering_failed = 0
+rendering_skipped = 0
+rendering_success = 0
+
+for idx, item in enumerate(tqdm(dt, desc="Rendering document images with highlighting", unit="item")):
+    # Skip items that already have answers
+    item_id = item.get('id', f"item_{idx}")
+    if item_id in qa_results:
+        rendering_skipped += 1
+        continue
+    
+    result = render_doc_images(item, item_index=idx)
+    
+    if result['success']:
+        if result['skipped']:
+            print(f"\nImages for item '{result['id']}' already exist, using existing images.")
+        else:
+            highlight_count = len(result.get('highlight_ranges', []))
+            print(f"\nRendered {len(result['image_paths'])} images for item '{result['id']}' with {highlight_count} highlighted ranges")
+        
+        items_needing_inference.append(result)
+        rendering_success += 1
+    else:
+        rendering_failed += 1
+        print(f"\nFailed to render item '{result['id']}': {result['error']}")
+
+print(f"\nRendering phase complete!")
+print(f"Total items: {len(dt)}")
+print(f"Already have answers (skipped): {len(qa_results)}")
+print(f"Successfully rendered/loaded: {rendering_success}")
+print(f"Failed to render: {rendering_failed}")
+
+# PHASE 2: Run inference (sequential or concurrent based on mode)
+if render_only:
+    print("\n" + "=" * 80)
+    print("RENDER-ONLY MODE: Skipping inference phase")
+    print("=" * 80)
+    print(f"All images have been rendered to: {OUTPUT_BASE_DIR}")
+elif items_needing_inference:
+    print("\n" + "=" * 80)
+    print(f"PHASE 2: RUNNING INFERENCE ({mode.upper()} mode)")
+    print("=" * 80)
+    
+    successful_inference = 0
+    failed_inference = 0
+    
+    if mode == 'sequential':
+        # Sequential inference
+        for item_info in tqdm(items_needing_inference, desc="Running inference", unit="item"):
+            result = run_inference(item_info)
+            
+            if result['success'] and result['answer']:
+                save_answer_to_json(result['id'], result['question'], result['answer'])
+                qa_results[result['id']] = {
+                    'question': result['question'],
+                    'answer': result['answer']
+                }
+                successful_inference += 1
+            else:
+                # Save full error trace to JSON
+                save_answer_to_json(result['id'], result['question'], result['answer'])
+                qa_results[result['id']] = {
+                    'question': result['question'],
+                    'answer': result['answer']
+                }
+                failed_inference += 1
+                error_msg = result['error'] if result['error'] else "Failed to generate answer"
+                print(f"\nFailed inference for item '{result['id']}': {error_msg}")
+    
+    else:  # concurrent mode
+        # Concurrent inference
+        print(f"Using {MAX_WORKERS} concurrent workers for inference...")
+        
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            # Submit all inference tasks
+            future_to_item = {executor.submit(run_inference, item_info): item_info for item_info in items_needing_inference}
+            
+            # Process completed tasks with progress tracking
+            with tqdm(total=len(items_needing_inference), desc="Running inference", unit="item") as pbar:
+                for future in as_completed(future_to_item):
+                    result = future.result()
+                    
+                    if result['success'] and result['answer']:
+                        save_answer_to_json(result['id'], result['question'], result['answer'])
+                        qa_results[result['id']] = {
+                            'question': result['question'],
+                            'answer': result['answer']
+                        }
+                        successful_inference += 1
+                        pbar.set_postfix({
+                            'Success': successful_inference, 
+                            'Failed': failed_inference,
+                            'Current': result['id'][:30] + '...' if len(result['id']) > 30 else result['id']
+                        })
+                    else:
+                        # Save full error trace to JSON
+                        save_answer_to_json(result['id'], result['question'], result['answer'])
+                        qa_results[result['id']] = {
+                            'question': result['question'],
+                            'answer': result['answer']
+                        }
+                        failed_inference += 1
+                        error_msg = result['error'] if result['error'] else "Failed to generate answer"
+                        print(f"\nFailed inference for item '{result['id']}': {error_msg}")
+                        pbar.set_postfix({
+                            'Success': successful_inference, 
+                            'Failed': failed_inference,
+                            'Current': f"FAILED: {result['id'][:20]}..."
+                        })
+                    
+                    pbar.update(1)
+    
+    print(f"\nInference phase complete!")
+    print(f"Successful inference: {successful_inference}")
+    print(f"Failed inference: {failed_inference}")
+else:
+    print("\nNo items need inference (all already processed)")
+
+# Final summary
+print("\n" + "=" * 80)
+print("FINAL SUMMARY")
+print("=" * 80)
+print(f"Total items in dataset: {len(dt)}")
+print(f"Total answers in output file: {len(qa_results)}")
+print(f"All answers saved to: {OUTPUT_JSON_FILE}")
+
